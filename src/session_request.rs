@@ -23,7 +23,7 @@ pub trait Session {
 }
 
 /// Indicates how the user interaction ended
-#[derive(Serialize, Deserialize, Type, Debug)]
+#[derive(Serialize, Deserialize, Type, Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u32)]
 pub enum ResponseCode {
     Success = 0,
@@ -39,10 +39,22 @@ pub trait Request {
     fn response(&self, response: ResponseCode, results: HashMap<String, OwnedValue>) -> Result<()>;
 }
 
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum RequestProxyError {
+    #[error("An invalid reply was received")]
+    InvalidReply,
+    #[error("The reply had an unexpected body")]
+    BadBody,
+    #[error("The request was not successful, ended with code {0:?}")]
+    NotSuccess(ResponseCode),
+    #[error("Failed for unknown reason: {0}")]
+    Other(String),
+}
+
 impl<'a> RequestProxy<'a> {
     pub async fn from_unique(conn: &Connection, handle: &UniqueToken) -> RequestProxy<'a> {
         RequestProxy::builder(conn)
-            .path(get_path_by_unique_id(conn, handle).await)
+            .path(get_path_by_unique_id("request", conn, handle).await)
             .unwrap()
             .destination(DESTINATION)
             .unwrap()
@@ -52,13 +64,48 @@ impl<'a> RequestProxy<'a> {
     }
 }
 
-pub async fn get_path_by_unique_id(conn: &Connection, handle: &UniqueToken) -> String {
+pub async fn get_path_by_unique_id(ty: &str, conn: &Connection, handle: &UniqueToken) -> String {
     format!(
-        "/org/freedesktop/portal/desktop/session/{}/{}",
+        "/org/freedesktop/portal/desktop/{ty}/{}/{handle}",
         conn.unique_name()
             .unwrap()
             .trim_start_matches(':')
-            .replace('.', "_"),
-        handle
+            .replace('.', "_")
     )
+}
+
+#[macro_export]
+/// Future, request, desired type
+macro_rules! call_and_receive_response {
+    ($future:expr, $req:ident, $ty:ty) => {{
+        use ::futures::StreamExt;
+        let mut stream = $req.receive_response().await?;
+        let (res, rp): ($ty, $crate::session_request::RequestProxy) = futures::try_join!(
+            async {
+                let res_item: $crate::session_request::Response = stream
+                    .next()
+                    .await
+                    .ok_or(::zbus::fdo::Error::ZBus(::zbus::Error::InvalidReply))?;
+
+                let (res_code, res) = res_item
+                    .body::<(u32, $ty)>()
+                    .map_err(|e| ::zbus::fdo::Error::ZBus(e))?;
+
+                if res_code == 0 {
+                    Ok(res)
+                } else {
+                    Err(::zbus::fdo::Error::Failed(
+                        "Interaction Cancelled: {res_code}".to_owned(),
+                    ))
+                }
+            },
+            async { $future.await.map_err(|e| ::zbus::fdo::Error::ZBus(e)) }
+        )?;
+
+        if $req.path() == rp.path() {
+            Ok(res)
+        } else {
+            Err(::zbus::fdo::Error::ZBus(::zbus::Error::InvalidReply))
+        }
+    }};
 }

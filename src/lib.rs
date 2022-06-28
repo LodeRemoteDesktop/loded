@@ -1,22 +1,28 @@
-use std::sync::Arc;
+use std::{collections::HashMap, io::Write, sync::Arc};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
+use serde::Serialize;
+use session_request::SessionProxy;
 use thiserror::Error;
+use zvariant::{ObjectPath, OwnedValue};
+
+use crate::{
+    handle_token::UniqueToken,
+    screencast::{
+        CreateSessionOptions, CreateSessionResponse, CursorMode, PersistMode, ScreencastProxy,
+        SelectSourcesOptions, SourceType, StartCastOptions, StartCastResponse,
+    },
+    session_request::RequestProxy,
+};
 
 pub mod handle_token;
 pub mod screencast;
 pub mod session_request;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub const DESTINATION: &str = "org.freedesktop.portal.Desktop";
+pub const PATH: &str = "/org/freedesktop/portal/desktop";
 
-/*
-use ashpd::{
-    desktop::{
-   &     screencast::{CursorMode, PersistMode, ScreenCastProxy, SourceType},
-        SessionProxy,
-    },
-    zbus, WindowIdentifier,
-};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -24,96 +30,172 @@ pub enum Error {
     NotStarted,
     #[error("DesktopManager is already running")]
     AlreadyStarted,
+    #[error("{0}")]
+    Other(String),
+    #[error("An operation on the token failed, this shouldn't occur and should be considered a serious matter")]
+    FailedTokenOperation,
 }
 
+/// Struct representing a desktop in an easier way
+#[derive(Serialize, Debug)]
 pub struct Desktop {
-    pub pipewire_path: u64,
+    /// The internal id of the desktop
+    pub id: String,
+    /// The pipewire path of the desktop
+    pub pipewire_path: u32,
+    /// The desktop's width
     pub width: i32,
+    /// The desktop's height
     pub height: i32,
-    pub index: u64,
 }
 
 pub struct CaptureManager<'a> {
     token: Option<String>,
-    connection: Option<zbus::Connection>,
+    connection: zbus::Connection,
     session: Option<Box<SessionProxy<'a>>>,
 }
 
 impl<'a> CaptureManager<'a> {
-    pub const fn new() -> Result<CaptureManager<'a>> {
+    pub async fn new() -> Result<CaptureManager<'a>> {
         Ok(Self {
             token: None,
-            connection: None,
+            connection: zbus::Connection::session().await?,
             session: None,
         })
     }
 
+    pub async fn try_get_token(&self) -> Result<String> {
+        Ok(std::fs::read_to_string("./token")?)
+    }
+
+    pub async fn try_write_token(&self) -> Result<()> {
+        if let Some(token) = self.token.as_ref() {
+            let mut file = std::fs::File::create("./token")?;
+            file.write_all(token.as_bytes())?;
+            Ok(())
+        } else {
+            Err(Error::FailedTokenOperation.into())
+        }
+    }
+
     /// Returns desktops and File descriptor
-    pub async fn begin_capture(&mut self) -> Result<(Vec<Desktop>, i32)> {
+    pub async fn begin_capture(&mut self) -> Result<Vec<Desktop>> {
+        if self.session.is_some() {
+            error!("CaptureManager is already running");
+            return Err(Error::AlreadyStarted.into());
+        }
+
         info!("Beginning Desktop Capture");
 
-        self.connection = Some(zbus::Connection::session().await?);
-
-        let proxy = ScreenCastProxy::new(self.connection.as_ref().unwrap()).await?;
-        let session = proxy.create_session().await?;
-        debug!("Made ScreenCastProxy and SessionProxy");
-
-        let token = &mut self.token;
-
-        proxy
-            .select_sources(
-                &session,
-                CursorMode::Embedded.into(),
-                SourceType::Monitor.into(),
-                false,
-                token.as_deref(),
-                PersistMode::Application,
-            )
-            .await?;
-        debug!("Set ScreenCastProxy Source Options");
-
-        let identifier = WindowIdentifier::default();
-
-        let (streams, new_token) = proxy.start(&session, &identifier).await?;
-        if let Some(t) = new_token {
-            token.replace(t);
+        match self.try_get_token().await {
+            Ok(v) => {
+                debug!("Refresh token present");
+                self.token = Some(v);
+            }
+            Err(e) => warn!("Failed to read refresh token: {e}"),
         }
-        let fd = proxy.open_pipe_wire_remote(&session).await?;
 
-        self.session = Some(session);
+        let proxy = ScreencastProxy::builder(&self.connection)
+            .path(PATH)?
+            .destination(DESTINATION)?
+            .build()
+            .await?;
 
-        debug!("Started ScreenCastProxy");
+        debug!("Getting session");
+        let sess_opts = CreateSessionOptions::default();
+        let sess_request =
+            RequestProxy::from_unique(&self.connection, &sess_opts.handle_token).await;
 
-        let desktop_vec: Vec<Desktop> = streams
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let (width, height) = match item.size() {
-                    Some(v) => v,
-                    None => {
-                        warn!("Desktop {index} is missing WIDTH and DEPTH, skipping encoding");
-                        return None;
-                    }
-                };
-                Some(Desktop {
-                    pipewire_path: item.pipe_wire_node_id().into(),
+        let csr: CreateSessionResponse = call_and_receive_response!(
+            proxy.create_session(&sess_opts),
+            sess_request,
+            CreateSessionResponse
+        )?;
+
+        let session = ObjectPath::try_from(
+            csr.session_handle
+                .expect("SessionHandle missing from successful CreateSessionResponse"),
+        )
+        .expect("Invalid SessionHandle in successful CreateSessionResponse");
+
+        let token = match &self.token {
+            Some(v) => {
+                info!("Refresh token present, using token");
+                Some(v.clone())
+            }
+            None => {
+                warn!("Refresh token not present");
+                None
+            }
+        };
+
+        debug!("Requesting capture sources");
+        let src_request_token = UniqueToken::new();
+        let src_request = RequestProxy::from_unique(&self.connection, &src_request_token).await;
+        let src_opts = SelectSourcesOptions {
+            handle_token: src_request_token,
+            types: Some(SourceType::MONITOR),
+            multiple: Some(true),
+            cursor_mode: Some(CursorMode::EMBEDDED),
+            restore_token: token,
+            persist_mode: Some(PersistMode::ExplicitlyRevoked),
+        };
+
+        let _ssr = call_and_receive_response!(proxy.select_sources(&session, &src_opts), src_request, HashMap<String, OwnedValue>)?;
+
+        debug!("Starting stream request");
+        let start_req_token = UniqueToken::new();
+        let start_req = RequestProxy::from_unique(&self.connection, &start_req_token).await;
+        let start_opts = StartCastOptions::new_from(&start_req_token);
+
+        let mut start_res = call_and_receive_response!(
+            proxy.start(&session, "RDESKTOPD", &start_opts,),
+            start_req,
+            StartCastResponse
+        )?;
+
+        self.token = Some(
+            start_res
+                .restore_token
+                .take()
+                .expect("No refresh token was present"),
+        );
+
+        match self.try_write_token().await {
+            Ok(_) => info!("Wrote refresh token"),
+            Err(e) => warn!("Failed to write refresh token. This will cause another permissions request the next time rdesktopd starts. Error: {e}"),
+        }
+
+        let desktops = start_res.streams.iter().filter_map(|i| {
+            let (width, height) = match i.properties().size() {
+                Some(v) => v,
+                None => {
+                    warn!("Desktop excluded due to missing size property: {:#?}\n(This probably isn't intentional)", i);
+                    return None;
+                }
+            };
+            let id = match i.properties().id() {
+                Some(v) => v,
+                None => {
+                    warn!("Desktop excluded due to missing id: {:#?}\n(This probably isn't intentional)", i);
+                    return None;
+                }
+            };
+            Some(
+                Desktop {
+                    id,
+                    pipewire_path: i.pipewire_path(),
                     width,
                     height,
-                    index: index as u64,
-                })
-            })
-            .collect::<Vec<Desktop>>();
-
+                }
+            )
+        }).collect::<Vec<Desktop>>();
         debug!("Filtered Viable Desktops");
 
-        Ok((desktop_vec, fd))
+        Ok(desktops)
     }
 
     pub async fn end_capture(&mut self) -> Result<()> {
-        let connection = match self.connection.take() {
-            Some(v) => v,
-            None => return Err(Error::NotStarted.into()),
-        };
         let session = match self.session.take() {
             Some(v) => v,
             None => return Err(Error::NotStarted.into()),
@@ -124,48 +206,11 @@ impl<'a> CaptureManager<'a> {
 
         info!("Ending Desktop Capture");
 
-        tokio::spawn(async move {
-            let _connection = connection;
-            session.close().await
-        });
+        session.close().await?;
 
         Ok(())
     }
 }
-*/
-
-pub const DESTINATION: &str = "org.freedesktop.portal.Desktop";
-pub const PATH: &str = "/org/freedesktop/portal/desktop";
 
 #[cfg(test)]
-mod tests {
-    use crate::{screencast::*, session_request::get_path_by_unique_id};
-
-    #[tokio::test]
-    async fn opens_menu() {
-        let conn = zbus::Connection::session().await.unwrap();
-
-        let mut connection_ops = CreateSessionOptions::default();
-
-        let path = get_path_by_unique_id(&conn, &connection_ops.handle_token).await;
-
-        println!("Path: {}", path);
-        let proxy = ScreencastProxy::builder(&conn)
-            .path(path)
-            .expect("Path was invalid in proxy builder")
-            .build()
-            .await
-            .expect("Failed to build proxy");
-
-        dbg!(&proxy);
-
-        loop {}
-
-        let val = proxy
-            .create_session(&connection_ops)
-            .await
-            .expect("Failed to create session");
-        dbg!(&val);
-        panic!()
-    }
-}
+mod tests {}

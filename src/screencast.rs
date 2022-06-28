@@ -1,41 +1,62 @@
-use std::collections::HashMap;
+use std::ops::BitOr;
 
 use serde::{Deserialize, Serialize};
 use zbus::{dbus_proxy, fdo::Result};
-use zvariant::{DeserializeDict, ObjectPath, OwnedFd, OwnedValue, SerializeDict, Type};
+use zvariant::{DeserializeDict, ObjectPath, SerializeDict, Type};
 
 use crate::handle_token::UniqueToken;
 use crate::session_request::*;
 
-use bitflags::bitflags;
+/// The source types that should be presented to be chose from
+#[derive(Type, Serialize, Deserialize, Debug, Clone)]
+#[zvariant(signature = "u")]
+#[repr(transparent)]
+pub struct SourceType(pub u32);
 
-bitflags! {
-    /// The source types that should be presented to be chose from
-    #[derive(Type, Serialize, Deserialize)]
-    pub struct SourceType: u32 {
-        /// Whole Monitors
-        const MONITOR = 1 << 0;
-        /// Specific Windows
-        const WINDOW = 1 << 1;
-        /// Virtual Desktops
-        const VIRTUAL = 1 << 2;
+impl SourceType {
+    /// Whole Monitors
+    pub const MONITOR: Self = Self(1 << 0);
+    /// Specific Windows
+    pub const WINDOW: Self = Self(1 << 1);
+    /// Virtual Desktops
+    pub const VIRTUAL: Self = Self(1 << 2);
+}
+
+impl BitOr for SourceType {
+    type Output = SourceType;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
     }
+}
 
-    /// The cursor mode to be used
-    #[derive(Type, Serialize, Deserialize)]
-    pub struct CursorMode: u32 {
-        /// The cursor isn't shown
-        const HIDDEN = 1 << 0;
-        /// The cursor is embedded in the stream
-        const EMBEDDED = 1 << 1;
-        /// The cursor's position is sent alongside pipewire stream data
-        const METADATA = 1 << 2;
+/// The cursor mode to be used
+#[derive(Type, Serialize, Deserialize, Debug, Clone)]
+#[zvariant(signature = "u")]
+#[repr(transparent)]
+pub struct CursorMode(u32);
+
+impl CursorMode {
+    /// The cursor isn't shown
+    pub const HIDDEN: Self = Self(1 << 0);
+    /// The cursor is embedded in the stream
+    pub const EMBEDDED: Self = Self(1 << 1);
+    /// The cursor's position is sent alongside pipewire stream data
+    pub const METADATA: Self = Self(1 << 2);
+}
+
+impl BitOr for CursorMode {
+    type Output = CursorMode;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
     }
 }
 
 /// Permission persistence options
 #[repr(u32)]
 #[derive(Type, Serialize, Deserialize, Debug)]
+#[zvariant(signature = "u")]
 pub enum PersistMode {
     /// Do not persist permissions
     DoNot = 0,
@@ -56,8 +77,7 @@ pub struct CreateSessionOptions {
 #[derive(DeserializeDict, SerializeDict, Type, Debug)]
 #[zvariant(signature = "dict")]
 pub struct CreateSessionResponse {
-    pub response: ResponseCode,
-    pub session_handle: String,
+    pub session_handle: Option<String>,
 }
 
 /// Options for the SelectSource method
@@ -67,15 +87,15 @@ pub struct SelectSourcesOptions {
     /// String to use as last element of handle
     pub handle_token: UniqueToken,
     /// Types of input to record (Use [SourceType])
-    pub types: Option<u32>,
+    pub types: Option<SourceType>,
     /// Allow multiple sources to be recorded
     pub multiple: Option<bool>,
     /// The cursor mode (Use [CursorMode])
-    pub cursor_mode: Option<u32>,
+    pub cursor_mode: Option<CursorMode>,
     /// The restore token
     pub restore_token: Option<String>,
     /// Permission persistence mode (Use [PersistMode])
-    pub persist_mode: Option<u32>,
+    pub persist_mode: Option<PersistMode>,
 }
 
 #[derive(SerializeDict, DeserializeDict, Type, Debug)]
@@ -85,8 +105,69 @@ pub struct StartCastOptions {
     pub handle_token: UniqueToken,
 }
 
-/// It's really just a string, anyways. Lifetimes are dumb and break stuff
-// pub type ObjectPath = String;
+impl StartCastOptions {
+    pub fn new_from(token: &UniqueToken) -> Self {
+        Self {
+            handle_token: token.clone(),
+        }
+    }
+}
+
+#[derive(SerializeDict, DeserializeDict, Type, Debug)]
+#[zvariant(signature = "dict")]
+pub struct StartCastResponse {
+    pub streams: Vec<Stream>,
+    pub restore_token: Option<String>,
+}
+
+/// Properties describing a stream
+#[derive(SerializeDict, DeserializeDict, Type, Debug, Clone)]
+#[zvariant(signature = "dict")]
+pub struct StreamProperties {
+    id: Option<String>,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    /// This is a [SourceType]
+    source_type: Option<SourceType>,
+}
+
+impl StreamProperties {
+    /// Gets the ID
+    pub fn id(&self) -> Option<String> {
+        self.id.clone()
+    }
+
+    /// Get the position in the format `(x, y)`
+    pub fn position(&self) -> Option<(i32, i32)> {
+        self.position
+    }
+
+    /// Get the size of the desktop in the format `(width, height)`
+    pub fn size(&self) -> Option<(i32, i32)> {
+        self.size
+    }
+
+    /// Get the source type
+    pub fn source_type(&self) -> Option<SourceType> {
+        self.source_type.clone()
+    }
+}
+
+/// Struct representing a stream with its associated pipewire path
+#[derive(Serialize, Deserialize, Type, Clone, Debug)]
+pub struct Stream(u32, StreamProperties);
+
+impl Stream {
+    /// Get the pipewire path of the contained stream
+    pub fn pipewire_path(&self) -> u32 {
+        self.0
+    }
+
+    /// Get the stream properties
+    pub fn properties(&self) -> &StreamProperties {
+        &self.1
+    }
+}
 
 #[dbus_proxy(interface = "org.freedesktop.portal.ScreenCast")]
 pub trait Screencast {
@@ -96,13 +177,14 @@ pub trait Screencast {
     #[dbus_proxy(object = "Request")]
     fn select_sources(&self, session_handle: &ObjectPath<'_>, options: &SelectSourcesOptions);
 
+    #[dbus_proxy(object = "Request")]
     fn open_pipe_wire_remote(
         &self,
         session_handle: &ObjectPath<'_>,
         options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
-    ) -> Result<OwnedFd>;
+    );
 
-    #[dbus_proxy(object = "Session")]
+    #[dbus_proxy(object = "Request")]
     fn start(
         &self,
         session_handle: &ObjectPath<'_>,
