@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use zbus::{dbus_proxy, fdo::Result};
 use zvariant::{DeserializeDict, ObjectPath, SerializeDict, Type};
 
-use crate::handle_token::UniqueToken;
 use crate::session_request::*;
+use crate::unique_token::UniqueToken;
 
 /// The source types that should be presented to be chose from
 #[derive(Type, Serialize, Deserialize, Debug, Clone)]
@@ -13,6 +13,7 @@ use crate::session_request::*;
 #[repr(transparent)]
 pub struct SourceType(pub u32);
 
+#[allow(dead_code)]
 impl SourceType {
     /// Whole Monitors
     pub const MONITOR: Self = Self(1 << 0);
@@ -36,6 +37,7 @@ impl BitOr for SourceType {
 #[repr(transparent)]
 pub struct CursorMode(u32);
 
+#[allow(dead_code)]
 impl CursorMode {
     /// The cursor isn't shown
     pub const HIDDEN: Self = Self(1 << 0);
@@ -131,6 +133,7 @@ pub struct StreamProperties {
     source_type: Option<SourceType>,
 }
 
+#[allow(dead_code)]
 impl StreamProperties {
     /// Gets the ID
     pub fn id(&self) -> Option<String> {
@@ -177,12 +180,11 @@ pub trait Screencast {
     #[dbus_proxy(object = "Request")]
     fn select_sources(&self, session_handle: &ObjectPath<'_>, options: &SelectSourcesOptions);
 
-    #[dbus_proxy(object = "Request")]
     fn open_pipe_wire_remote(
         &self,
         session_handle: &ObjectPath<'_>,
         options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
-    );
+    ) -> Result<u32>;
 
     #[dbus_proxy(object = "Request")]
     fn start(

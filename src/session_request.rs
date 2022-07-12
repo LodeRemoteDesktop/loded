@@ -5,7 +5,7 @@ use zvariant::{OwnedValue, Type};
 
 use zbus::{dbus_proxy, fdo::Result, Connection};
 
-use crate::{handle_token::UniqueToken, DESTINATION};
+use crate::{unique_token::UniqueToken, DESTINATION};
 
 #[dbus_proxy(
     interface = "org.freedesktop.portal.Session",
@@ -37,18 +37,6 @@ pub trait Request {
 
     #[dbus_proxy(signal)]
     fn response(&self, response: ResponseCode, results: HashMap<String, OwnedValue>) -> Result<()>;
-}
-
-#[derive(thiserror::Error, Debug, Clone)]
-pub enum RequestProxyError {
-    #[error("An invalid reply was received")]
-    InvalidReply,
-    #[error("The reply had an unexpected body")]
-    BadBody,
-    #[error("The request was not successful, ended with code {0:?}")]
-    NotSuccess(ResponseCode),
-    #[error("Failed for unknown reason: {0}")]
-    Other(String),
 }
 
 impl<'a> RequestProxy<'a> {
