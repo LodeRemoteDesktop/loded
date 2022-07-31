@@ -1,6 +1,9 @@
+#![feature(new_uninit)]
+
 pub(crate) mod api;
 pub(crate) mod capture;
 pub(crate) mod input;
+pub(crate) mod protocol;
 pub(crate) mod screencast;
 pub(crate) mod session_request;
 pub(crate) mod unique_token;

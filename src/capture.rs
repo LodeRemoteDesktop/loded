@@ -1,9 +1,12 @@
-use std::{collections::HashMap, io::Write, net::TcpListener, process::Command};
+use std::{collections::HashMap, net::TcpListener, process::Command};
 // use std::process::Stdio;
 
 use log::{debug, error, info, warn};
 use serde::Serialize;
-use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::broadcast::{Receiver, Sender},
+};
 use zvariant::{ObjectPath, OwnedValue};
 
 use crate::{
@@ -28,8 +31,10 @@ pub enum Error {
 /// Struct representing a desktop in an easier way
 #[derive(Serialize, Debug, Clone)]
 pub struct Desktop {
-    /// The internal id of the desktop
+    /// The pipewire internal id of the desktop
     pub id: String,
+    /// Loded id
+    pub loded_id: u64,
     /// The pipewire path of the desktop
     pub pipewire_path: u32,
     /// The desktop's width
@@ -56,13 +61,13 @@ impl<'a> CaptureManager<'a> {
     }
 
     async fn try_get_token(&self) -> Result<String> {
-        Ok(std::fs::read_to_string("./token")?)
+        Ok(tokio::fs::read_to_string("./token").await?)
     }
 
     async fn try_write_token(&self) -> Result<()> {
         if let Some(token) = self.token.as_ref() {
-            let mut file = std::fs::File::create("./token")?;
-            file.write_all(token.as_bytes())?;
+            let mut file = tokio::fs::File::create("./token").await?;
+            file.write_all(token.as_bytes()).await?;
             Ok(())
         } else {
             Err(Error::FailedTokenOperation.into())
@@ -157,7 +162,7 @@ impl<'a> CaptureManager<'a> {
             Err(e) => warn!("Failed to write refresh token. This will cause another permissions request the next time rdesktopd starts. Error: {e}"),
         }
 
-        let desktops = start_res.streams.iter().filter_map(|i| {
+        let desktops = start_res.streams.iter().enumerate().filter_map(|(idx, i)| {
             let (width, height) = match i.properties().size() {
                 Some(v) => v,
                 None => {
@@ -175,6 +180,7 @@ impl<'a> CaptureManager<'a> {
             Some(
                 Desktop {
                     id,
+                    loded_id: idx as u64,
                     pipewire_path: i.pipewire_path(),
                     width,
                     height,
@@ -205,9 +211,7 @@ impl<'a> CaptureManager<'a> {
                 Some(Desktop {
                     port: Some(port),
                     id: d.id.clone(),
-                    pipewire_path: d.pipewire_path,
-                    width: d.width,
-                    height: d.height,
+                    ..*d
                 })
             })
             .collect::<Vec<Desktop>>();
